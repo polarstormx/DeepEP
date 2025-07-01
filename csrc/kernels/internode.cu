@@ -389,6 +389,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     // RDMA symmetric layout
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
+    auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_rdma_token = get_num_bytes_per_rdma_token(hidden_int4, num_scales, num_topk, num_topk);
     auto rdma_channel_data = SymBuffer<int8_t>(rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
@@ -432,7 +433,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         mbarrier_init(tma_mbarrier, 1);
         fence_view_async_shared();
         fence_barrier_init();
-        EP_DEVICE_ASSERT(hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(hidden_bytes + scale_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 
@@ -785,20 +786,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Copy data
                 if (lane_id == 31) {
-                    tma_load_1d(tma_buffer, static_cast<int4*>(shifted), tma_mbarrier, hidden_bytes, false);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                    tma_load_1d(tma_buffer, static_cast<int4*>(shifted), tma_mbarrier, hidden_bytes + scale_bytes, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes + scale_bytes);
                     mbarrier_wait(tma_mbarrier, tma_phase);
                     tma_store_1d(tma_buffer, nvl_channel_x.buffer() + dst_slot_idx * hidden_int4, hidden_bytes);
+                    tma_store_1d(tma_buffer + hidden_bytes, nvl_channel_x_scales.buffer() + dst_slot_idx * num_scales, scale_bytes);
                 }
-                __syncwarp();
-                shifted = static_cast<int4*>(shifted) + hidden_int4;
-
-                // Copy `x_scales`
-                UNROLLED_WARP_COPY(1, lane_id, num_scales,
-                                   nvl_channel_x_scales.buffer() + dst_slot_idx * num_scales,
-                                   reinterpret_cast<float*>(shifted),
-                                   ld_nc_global, st_na_global);
-                shifted = static_cast<float*>(shifted) + num_scales;
+                shifted = reinterpret_cast<uint8_t*>(shifted) + hidden_bytes + scale_bytes;
 
                 // Copy source meta
                 if (lane_id == 0)
