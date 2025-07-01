@@ -82,7 +82,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     time.sleep(1)
 
     # Config
-    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
+    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 768)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
@@ -229,7 +229,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_sms = 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
 
-    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
+    buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank)
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
