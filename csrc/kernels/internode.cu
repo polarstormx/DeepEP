@@ -434,6 +434,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         fence_view_async_shared();
         fence_barrier_init();
         EP_DEVICE_ASSERT(hidden_bytes + scale_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(scale_bytes % 16 == 0);
     }
     __syncwarp();
 
@@ -942,23 +943,18 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
                 // Copy data
-                if (lane_id == 0) {
+                if (lane_id == 31) {
                     tma_load_1d(tma_buffer, nvl_channel_x.buffer() + token_idx_in_buffer * hidden_int4, tma_mbarrier, hidden_bytes);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                    tma_load_1d(tma_buffer + hidden_bytes, nvl_channel_x_scales.buffer() + token_idx_in_buffer * num_scales, tma_mbarrier, scale_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes + scale_bytes);
                     mbarrier_wait(tma_mbarrier, tma_phase);
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
+                    tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
                 }
-                __syncwarp();
 
                 // Copy source meta
                 if (lane_id == 0 and not kCachedMode)
                     st_na_global(recv_src_meta + recv_token_idx, meta);
-
-                // Copy scales
-                UNROLLED_WARP_COPY(1, lane_id, num_scales,
-                                   recv_x_scales + recv_token_idx * num_scales,
-                                   nvl_channel_x_scales.buffer() + token_idx_in_buffer * num_scales,
-                                   ld_nc_global, st_na_global);
 
                 // Copy `topk_idx` and `topk_weights`
                 if (lane_id < num_topk) {
@@ -969,7 +965,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 
                 // Wait TMA to be finished
-                if (lane_id == 0)
+                if (lane_id == 31)
                     tma_store_wait();
                 __syncwarp();
             }
