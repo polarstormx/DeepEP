@@ -728,7 +728,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
-            while (lane_id == 0) {
+            while (lane_id == 31) {
                 int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
                     break;
@@ -784,7 +784,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 int dst_slot_idx = (cached_nvl_channel_tail ++) % num_max_nvl_chunked_recv_tokens;
 
                 // Copy data
-                if (lane_id == 0) {
+                if (lane_id == 31) {
                     tma_load_1d(tma_buffer, static_cast<int4*>(shifted), tma_mbarrier, hidden_bytes, false);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
                     mbarrier_wait(tma_mbarrier, tma_phase);
@@ -794,7 +794,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 shifted = static_cast<int4*>(shifted) + hidden_int4;
 
                 // Copy source meta
-                if (lane_id == 0)
+                if (lane_id == 31)
                     st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx, src_meta);
                 shifted = static_cast<SourceMeta*>(shifted) + 1;
 
@@ -825,7 +825,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     src_rdma_tail = i + 1;
 
                 // Wait TMA to be finished
-                if (lane_id == 0)
+                if (lane_id == 31)
                     tma_store_wait();
                 __syncwarp();
             }
@@ -836,7 +836,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Move tail index
             __syncwarp();
-            if (lane_id == 0)
+            if (lane_id == 31)
                 st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
 
