@@ -729,9 +729,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
+            int num_available_slots = 0; 
             while (lane_id == 31) {
-                int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
-                if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
+                num_available_slots = num_max_nvl_chunked_recv_tokens -  cached_nvl_channel_tail + cached_nvl_channel_head;
+                // Before each send, ensure that there are at least `num_max_nvl_chunked_send_tokens` slots available. 
+                // However, it is possible that more tokens may actually be sent during the send operation.
+                if (num_available_slots >= num_max_nvl_chunked_send_tokens)
                     break;
                 cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
 
@@ -815,7 +818,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 
                 // In case of insufficient NVL buffers, early stopping
-                if ((++ num_tokens_sent) == num_max_nvl_chunked_send_tokens)
+                if ((++ num_tokens_sent) == num_available_slots)
                     src_rdma_tail = i + 1;
 
                 // Wait TMA to be finished
