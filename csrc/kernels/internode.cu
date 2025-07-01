@@ -535,13 +535,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int i = 0; i < num_topk_ranks; ++ i)
                 dst_send_buffers[i] = reinterpret_cast<int4*>(dst_send_buffers[i]) + hidden_int4;
 
-            // Copy source metadata into symmetric send buffer
-            if (lane_id < num_topk_ranks)
-                st_na_global(reinterpret_cast<SourceMeta*>(dst_send_buffers[lane_id]), src_meta);
-            #pragma unroll
-            for (int i = 0; i < num_topk_ranks; ++ i)
-                dst_send_buffers[i] = reinterpret_cast<SourceMeta*>(dst_send_buffers[i]) + 1;
-
             // Copy `x_scales` into symmetric send buffer
             #pragma unroll
             for (int i = lane_id; i < num_scales; i += 32) {
@@ -554,6 +547,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             #pragma unroll
             for (int i = 0; i < num_topk_ranks; ++ i)
                 dst_send_buffers[i] = reinterpret_cast<float*>(dst_send_buffers[i]) + num_scales;
+
+            // Copy source metadata into symmetric send buffer
+            if (lane_id < num_topk_ranks)
+                st_na_global(reinterpret_cast<SourceMeta*>(dst_send_buffers[lane_id]), src_meta);
+            #pragma unroll
+            for (int i = 0; i < num_topk_ranks; ++ i)
+                dst_send_buffers[i] = reinterpret_cast<SourceMeta*>(dst_send_buffers[i]) + 1;
 
             // Copy `topk_idx` and `topk_weights` into symmetric send buffer
             #pragma unroll
@@ -768,7 +768,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
                 void* shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token;
-                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(static_cast<int8_t*>(shifted) + hidden_bytes));
+                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(static_cast<int8_t*>(shifted) + hidden_bytes + num_scales * sizeof(float)));
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
                 if (lane_id == src_rdma_rank) {
@@ -793,17 +793,17 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 __syncwarp();
                 shifted = static_cast<int4*>(shifted) + hidden_int4;
 
-                // Copy source meta
-                if (lane_id == 31)
-                    st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx, src_meta);
-                shifted = static_cast<SourceMeta*>(shifted) + 1;
-
                 // Copy `x_scales`
                 UNROLLED_WARP_COPY(1, lane_id, num_scales,
                                    nvl_channel_x_scales.buffer() + dst_slot_idx * num_scales,
                                    reinterpret_cast<float*>(shifted),
                                    ld_nc_global, st_na_global);
                 shifted = static_cast<float*>(shifted) + num_scales;
+
+                // Copy source meta
+                if (lane_id == 0)
+                    st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx, src_meta);
+                shifted = static_cast<SourceMeta*>(shifted) + 1;
 
                 // Copy `topk_idx` and `topk_weights`
                 // NOTES: do not use `shifted` after this `if`, because only several lanes are shifted
