@@ -731,22 +731,21 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
             int num_available_slots = 0; 
-            while (lane_id == 31) {
+            while (true) {
                 num_available_slots = num_max_nvl_chunked_recv_tokens -  cached_nvl_channel_tail + cached_nvl_channel_head;
                 // Before each send, ensure that there are at least `num_max_nvl_chunked_send_tokens` slots available. 
                 // However, it is possible that more tokens may actually be sent during the send operation.
                 if (num_available_slots >= num_max_nvl_chunked_send_tokens)
                     break;
-                cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
+                cached_nvl_channel_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                if (lane_id == 0 and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
                     trap();
                 }
             }
-            __syncwarp();
 
             // Find next source RDMA rank (round-robin)
             start_time = clock64();
@@ -788,14 +787,18 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 // Get an empty slot
                 int dst_slot_idx = (cached_nvl_channel_tail ++) % num_max_nvl_chunked_recv_tokens;
 
-                // Copy data
-                if (lane_id == 31) {
+                // Copy data and scales
+                if (lane_id == 0) {
                     tma_load_1d(tma_buffer, static_cast<int4*>(shifted), tma_mbarrier, hidden_bytes + scale_bytes, false);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes + scale_bytes);
-                    mbarrier_wait(tma_mbarrier, tma_phase);
+                }
+                __syncwarp();
+                mbarrier_wait(tma_mbarrier, tma_phase);
+                if (lane_id) {
                     tma_store_1d(tma_buffer, nvl_channel_x.buffer() + dst_slot_idx * hidden_int4, hidden_bytes);
                     tma_store_1d(tma_buffer + hidden_bytes, nvl_channel_x_scales.buffer() + dst_slot_idx * num_scales, scale_bytes);
                 }
+                __syncwarp();
                 shifted = reinterpret_cast<uint8_t*>(shifted) + hidden_bytes + scale_bytes;
 
                 // Copy source meta
@@ -823,8 +826,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     src_rdma_tail = i + 1;
 
                 // Wait TMA to be finished
-                if (lane_id == 31)
-                    tma_store_wait();
+                tma_store_wait();
                 __syncwarp();
             }
 
@@ -834,7 +836,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Move tail index
             __syncwarp();
-            if (lane_id == 31)
+            if (lane_id == 0)
                 st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
 
@@ -917,22 +919,19 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         while (num_tokens_to_recv > 0) {
             // Check channel status by lane 0
             start_time = clock64();
-            while (lane_id == 0) {
+            while (true) {
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer());
+                cached_channel_tail_idx = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                if (lane_id == 0 and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
                     trap();
                 }
             }
-
-            // Sync queue tail
-            cached_channel_tail_idx = __shfl_sync(0xffffffff, cached_channel_tail_idx, 0);
 
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
@@ -942,15 +941,19 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
-                // Copy data
-                if (lane_id == 31) {
+                // Copy data and scales
+                if (lane_id == 0) {
                     tma_load_1d(tma_buffer, nvl_channel_x.buffer() + token_idx_in_buffer * hidden_int4, tma_mbarrier, hidden_bytes);
                     tma_load_1d(tma_buffer + hidden_bytes, nvl_channel_x_scales.buffer() + token_idx_in_buffer * num_scales, tma_mbarrier, scale_bytes);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes + scale_bytes);
-                    mbarrier_wait(tma_mbarrier, tma_phase);
+                }
+                __syncwarp();
+                mbarrier_wait(tma_mbarrier, tma_phase);
+                if (lane_id == 0) {
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
                     tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
                 }
+                __syncwarp();
 
                 // Copy source meta
                 if (lane_id == 0 and not kCachedMode)
@@ -965,8 +968,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 
                 // Wait TMA to be finished
-                if (lane_id == 31)
-                    tma_store_wait();
+                tma_store_wait();
                 __syncwarp();
             }
 
