@@ -53,11 +53,12 @@ std::pair<int, int> get_rdma_clean_meta(int hidden_int4, int num_scales, int num
 }
 
 __host__ __device__ __forceinline__
-std::pair<int, int> get_nvl_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_nvl_ranks, int num_nvl_recv_buffer_tokens, int num_channels) {
+std::pair<int, int> get_nvl_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_nvl_ranks, int num_nvl_recv_buffer_tokens, int num_channels, bool is_dispatch) {
     // Return `int32_t` offset and to clean
     EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+    int num_bytes_per_token = is_dispatch ? get_num_bytes_per_rdma_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) : (hidden_int4 * sizeof(int4) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float) + sizeof(SourceMeta));
     return {
-        (num_nvl_recv_buffer_tokens * (hidden_int4 * sizeof(int4) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float) + sizeof(SourceMeta)) * num_nvl_ranks * num_channels) / sizeof(int),
+        (num_nvl_recv_buffer_tokens * num_bytes_per_token * num_nvl_ranks * num_channels) / sizeof(int),
         num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels,
     };
 }
@@ -314,7 +315,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
 
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
-    auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
+    auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels, true);
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
@@ -406,11 +407,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         rs_wr_buffer_ptr = buffer_ptrs[target_rank], ws_rr_buffer_ptr = buffer_ptrs[nvl_rank], rs_wr_rank = target_rank, ws_rr_rank = nvl_rank;
 
     // Allocate buffers
-    auto nvl_channel_x = AsymBuffer<int4>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * hidden_int4, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_src_meta = AsymBuffer<SourceMeta>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_x_scales = AsymBuffer<float>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_scales, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_topk_idx = AsymBuffer<int>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_topk, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_topk_weights = AsymBuffer<float>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_topk, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
+    auto nvl_channel_x = AsymBuffer<int8_t>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_bytes_per_rdma_token, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_prefix_start = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_prefix_end = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_head = AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
@@ -770,7 +767,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Iterate over every token from the RDMA buffer
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
-                void* shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token;
+                int8_t* shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token;
                 auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(static_cast<int8_t*>(shifted) + hidden_bytes + scale_bytes));
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
@@ -785,45 +782,46 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Get an empty slot
                 int dst_slot_idx = (cached_nvl_channel_tail ++) % num_max_nvl_chunked_recv_tokens;
+                int8_t *dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_rdma_token; 
 
                 // Copy data 
                 if (lane_id == 0) {
-                    tma_load_1d(tma_buffer, static_cast<int4*>(shifted), tma_mbarrier, hidden_bytes, false);
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes, false);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
                 }
                 __syncwarp();
                 mbarrier_wait(tma_mbarrier, tma_phase);
-                if (lane_id) {
-                    tma_store_1d(tma_buffer, nvl_channel_x.buffer() + dst_slot_idx * hidden_int4, hidden_bytes);
-                }
+                    tma_store_1d(tma_buffer, dst_shifted, hidden_bytes);
                 __syncwarp();
-                shifted = reinterpret_cast<uint8_t*>(shifted) + hidden_bytes;
+                shifted += hidden_bytes;
+                dst_shifted += hidden_bytes;
 
                 // Copy `x_scales`
                 UNROLLED_WARP_COPY(1, lane_id, num_scales,
-                                   nvl_channel_x_scales.buffer() + dst_slot_idx * num_scales,
+                                   reinterpret_cast<float*>(dst_shifted),
                                    reinterpret_cast<float*>(shifted),
                                    ld_nc_global, st_na_global);
-                shifted = static_cast<float*>(shifted) + num_scales;
+                shifted += scale_bytes;
+                dst_shifted += scale_bytes;
 
                 // Copy source meta
                 if (lane_id == 0)
-                    st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx, src_meta);
-                shifted = static_cast<SourceMeta*>(shifted) + 1;
+                    st_na_global(reinterpret_cast<SourceMeta*>(dst_shifted), src_meta);
+                shifted += sizeof(SourceMeta);
+                dst_shifted += sizeof(SourceMeta);
 
                 // Copy `topk_idx` and `topk_weights`
                 // NOTES: do not use `shifted` after this `if`, because only several lanes are shifted
                 if (lane_id < num_topk) {
                     // Read
-                    auto idx_value = ld_nc_global(static_cast<int*>(shifted) + lane_id);
-                    shifted = static_cast<int*>(shifted) + num_topk;
-                    auto weight_value = ld_nc_global(static_cast<float*>(shifted) + lane_id);
+                    auto idx_value = ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id);
+                    auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id);
 
                     // Transform and write
                     idx_value = (idx_value >= dst_rank_expert_begin and idx_value < dst_rank_expert_end) ? idx_value - dst_rank_expert_begin : -1;
-                    st_na_global(nvl_channel_topk_idx.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
+                    st_na_global(reinterpret_cast<int*>(dst_shifted) + lane_id, idx_value);
                     weight_value = idx_value >= 0 ? weight_value : 0.0f;
-                    st_na_global(nvl_channel_topk_weights.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
+                    st_na_global(reinterpret_cast<float*>(dst_shifted + sizeof(int) * num_topk) + lane_id, weight_value);
                 }
 
                 // In case of insufficient NVL buffers, early stopping
@@ -942,13 +940,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx ++) % num_max_nvl_chunked_recv_tokens;
-                auto meta = ld_nc_global(nvl_channel_src_meta.buffer() + token_idx_in_buffer);
+                int8_t* shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_rdma_token;
+                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
                 // Copy data and scales
                 if (lane_id == 0) {
-                    tma_load_1d(tma_buffer, nvl_channel_x.buffer() + token_idx_in_buffer * hidden_int4, tma_mbarrier, hidden_bytes);
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
                 }
                 __syncwarp();
@@ -957,24 +956,25 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
                 }
                 __syncwarp();
+                shifted += hidden_bytes;
 
                 // Copy scales
                 UNROLLED_WARP_COPY(1, lane_id, num_scales,
                                    recv_x_scales + recv_token_idx * num_scales,
-                                   nvl_channel_x_scales.buffer() + token_idx_in_buffer * num_scales,
+                                   reinterpret_cast<float*>(shifted),
                                    ld_nc_global, st_na_global);
-
+                shifted += scale_bytes;
 
                 // Copy source meta
                 if (lane_id == 0 and not kCachedMode)
                     st_na_global(recv_src_meta + recv_token_idx, meta);
+                shifted += sizeof(SourceMeta);
 
                 // Copy `topk_idx` and `topk_weights`
                 if (lane_id < num_topk) {
                     auto recv_idx = recv_token_idx * num_topk + lane_id;
-                    auto buffer_idx = token_idx_in_buffer * num_topk + lane_id;
-                    st_na_global(recv_topk_idx + recv_idx, static_cast<int64_t>(ld_nc_global(nvl_channel_topk_idx.buffer() + buffer_idx)));
-                    st_na_global(recv_topk_weights + recv_idx, ld_nc_global(nvl_channel_topk_weights.buffer() + buffer_idx));
+                    st_na_global(recv_topk_idx + recv_idx, static_cast<int64_t>(ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id)));
+                    st_na_global(recv_topk_weights + recv_idx, ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id));
                 }
 
                 // Wait TMA to be finished
@@ -1153,7 +1153,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
 
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
-    auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
+    auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels, is_cached_dispatch);
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
