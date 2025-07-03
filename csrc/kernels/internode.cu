@@ -916,10 +916,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
-                // Copy data and scales
+                bool scale_aligned = (scale_bytes % 16 == 0);
+                auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
+
+                // Copy data 
                 if (lane_id == 0) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, tma_load_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, tma_load_bytes);
                 }
                 __syncwarp();
                 mbarrier_wait(tma_mbarrier, tma_phase);
@@ -930,10 +933,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 shifted += hidden_bytes;
 
                 // Copy scales
-                UNROLLED_WARP_COPY(1, lane_id, num_scales,
-                                   recv_x_scales + recv_token_idx * num_scales,
-                                   reinterpret_cast<float*>(shifted),
-                                   ld_nc_global, st_na_global);
+                if (scale_aligned) {
+                    tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
+                } else {
+                    UNROLLED_WARP_COPY(1, lane_id, num_scales,
+                                    recv_x_scales + recv_token_idx * num_scales,
+                                    reinterpret_cast<float*>(shifted),
+                                    ld_nc_global, st_na_global);
+                }
                 shifted += scale_bytes;
 
                 // Copy source meta
