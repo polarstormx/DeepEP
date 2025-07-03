@@ -430,7 +430,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         mbarrier_init(tma_mbarrier, 1);
         fence_view_async_shared();
         fence_barrier_init();
-        EP_DEVICE_ASSERT(hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(num_bytes_per_rdma_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 
@@ -783,40 +783,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Copy data 
                 if (lane_id == 0) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes, false);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, num_bytes_per_rdma_token, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, num_bytes_per_rdma_token);
                 }
                 __syncwarp();
                 mbarrier_wait(tma_mbarrier, tma_phase);
-                    tma_store_1d(tma_buffer, dst_shifted, hidden_bytes);
-                __syncwarp();
-                shifted += hidden_bytes;
-                dst_shifted += hidden_bytes;
-
-                // Copy `x_scales`
-                UNROLLED_WARP_COPY(1, lane_id, num_scales,
-                                   reinterpret_cast<float*>(dst_shifted),
-                                   reinterpret_cast<float*>(shifted),
-                                   ld_nc_global, st_na_global);
-                shifted += scale_bytes;
-                dst_shifted += scale_bytes;
-
-                // Copy source meta
                 if (lane_id == 0)
-                    st_na_global(reinterpret_cast<SourceMeta*>(dst_shifted), src_meta);
-                shifted += sizeof(SourceMeta);
-                dst_shifted += sizeof(SourceMeta);
-
-                // Copy `topk_idx` and `topk_weights`
-                // NOTES: do not use `shifted` after this `if`, because only several lanes are shifted
-                if (lane_id < num_topk) {
-                    // Read
-                    auto idx_value = ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id);
-                    auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id);
-
-                    st_na_global(reinterpret_cast<int*>(dst_shifted) + lane_id, idx_value);
-                    st_na_global(reinterpret_cast<float*>(dst_shifted + sizeof(int) * num_topk) + lane_id, weight_value);
-                }
+                    tma_store_1d(tma_buffer, dst_shifted, num_bytes_per_rdma_token);
+                __syncwarp();
 
                 // In case of insufficient NVL buffers, early stopping
                 if ((++ num_tokens_sent) == num_available_slots)
