@@ -670,9 +670,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
         // RDMA consumers and NVL producers
         const auto dst_nvl_rank = target_rank;
-        const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank;
-        const auto dst_rank_expert_begin = dst_rank * (num_experts / num_ranks);
-        const auto dst_rank_expert_end = dst_rank_expert_begin + (num_experts / num_ranks);
 
         // Wait counters to arrive
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
@@ -817,10 +814,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     auto idx_value = ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id);
                     auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id);
 
-                    // Transform and write
-                    idx_value = (idx_value >= dst_rank_expert_begin and idx_value < dst_rank_expert_end) ? idx_value - dst_rank_expert_begin : -1;
                     st_na_global(reinterpret_cast<int*>(dst_shifted) + lane_id, idx_value);
-                    weight_value = idx_value >= 0 ? weight_value : 0.0f;
                     st_na_global(reinterpret_cast<float*>(dst_shifted + sizeof(int) * num_topk) + lane_id, weight_value);
                 }
 
@@ -888,6 +882,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // NVL consumers
         // Retrieve rank offset from barrier results (each lane's register stores an RDMA rank)
         int src_nvl_rank = target_rank, total_offset = 0;
+        const auto local_expert_begin = rank * (num_experts / num_ranks);
+        const auto local_expert_end = local_expert_begin + (num_experts / num_ranks);
+
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
         if (lane_id < kNumRDMARanks and lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank > 0)
             total_offset = recv_gbl_rank_prefix_sum[lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank - 1];
@@ -972,9 +969,16 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Copy `topk_idx` and `topk_weights`
                 if (lane_id < num_topk) {
+                    // Read
+                    auto idx_value = static_cast<int64_t>(ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id));
+                    auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id);
                     auto recv_idx = recv_token_idx * num_topk + lane_id;
-                    st_na_global(recv_topk_idx + recv_idx, static_cast<int64_t>(ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id)));
-                    st_na_global(recv_topk_weights + recv_idx, ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id));
+
+                    // Transform and write
+                    idx_value = (idx_value >= local_expert_begin and idx_value < local_expert_end) ? idx_value - local_expert_begin : -1;
+                    weight_value = idx_value >= 0 ? weight_value : 0.0f;
+                    st_na_global(recv_topk_idx + recv_idx, idx_value);
+                    st_na_global(recv_topk_weights + recv_idx, weight_value);
                 }
 
                 // Wait TMA to be finished
